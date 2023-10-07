@@ -1,0 +1,1080 @@
+#!/bin/sh
+#-------------------------------------------------------------------------+
+# Copyright (C) 2016 Matt Churchyard (churchers@gmail.com)
+# All rights reserved
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted providing that the following conditions
+# are met:
+# 1. Redistributions of source code must retain the above copyright
+#    notice, this list of conditions and the following disclaimer.
+# 2. Redistributions in binary form must reproduce the above copyright
+#    notice, this list of conditions and the following disclaimer in the
+#    documentation and/or other materials provided with the distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESS OR
+# IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+# WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+# ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY
+# DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+# OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+# HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
+# STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING
+# IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+# POSSIBILITY OF SUCH DAMAGE.
+
+# 'vm list'
+# list virtual machines
+#
+core::list(){
+    local _name _loader _cpu _our_host
+    local _memory _run _vm _auto _num _vnc _pid
+    local _state _pcpu _rss _uptime
+    local _format="%s^%s^%s^%s^%s^%s^%s^%s\n"
+
+    cmd::parse_args "$@"
+    shift $?
+
+    _our_host=$(hostname)
+
+    vm::running_load
+
+    [ -n "${VM_OPT_VERBOSE}" ] && _format="%s^%s^%s^%s^%s^%s^%s^%5s^%8s^%14s^%s\n";
+
+    # pass everything below here to column(1)
+    {
+        if [ -n "${VM_OPT_VERBOSE}" ]; then
+            printf "${_format}" "NAME" "DATASTORE" "LOADER" "CPU" "MEMORY" "VNC" "AUTO" "%CPU" "RSZ" "UPTIME" "STATE"
+        else
+            printf "${_format}" "NAME" "DATASTORE" "LOADER" "CPU" "MEMORY" "VNC" "AUTO" "STATE"
+        fi
+
+        for _ds in ${VM_DATASTORE_LIST}; do
+            datastore::get "${_ds}" || continue
+
+            ls -1 "${VM_DS_PATH}" 2>/dev/null | \
+            while read _name; do
+                [ ! -e "${VM_DS_PATH}/${_name}/${_name}.conf" ] && continue
+
+                config::load "${VM_DS_PATH}/${_name}/${_name}.conf"
+                config::get "_loader" "loader" "none"
+                config::get "_cpu" "cpu"
+                config::get "_memory" "memory"
+
+                # defaults
+                _vnc="-"
+                _pid=""
+                _state=""
+                _pcpu="-"
+                _rss="-"
+                _uptime="-"
+
+                # check if the guest is running
+                if vm::running_check "_run" "_pid" "${_name}" || \
+                    [ -e "${VM_DS_PATH}/${_name}/run.lock" -a "$(head -n1 ${VM_DS_PATH}/${_name}/run.lock 2>/dev/null)" = "${_our_host}" ]; then
+
+                    # if running and graphics, try to get vnc port
+                    if config::yesno "graphics"; then
+                        _vnc=$(grep vnc "${VM_DS_PATH}/${_name}/console" 2>/dev/null |cut -d= -f2)
+                        [ -z "${_vnc}" ] && _vnc="-"
+                    fi
+                fi
+
+                if [ -n "${_pid}" -a -n "${VM_OPT_VERBOSE}" ]; then
+                    _state=$(ps -o"%cpu"= -o"rss"= -o"etime"= -p "${_pid}")
+
+                    if [ -n "${_state}" ]; then
+                        util::get_part "_pcpu" "${_state}" 1
+                        util::get_part "_rss" "${_state}" 2
+                        util::get_part "_uptime" "${_state}" 3
+
+                        [ -n "${_rss}" ] && _rss=$(info::__bytes_human "${_rss}" 1 2)
+                        _uptime=$(echo "${_uptime}" |sed 's/\-/d /')
+                    fi
+                fi
+
+                _num=1
+                _auto="No"
+
+                # find out if we auto-start this vm, and get sequence number
+                for _vm in ${vm_list}; do
+                    [ "${_vm}" = "${_name}" ] && _auto="Yes [${_num}]"
+                    _num=$((_num + 1))
+                done
+
+                # if stopped, see if it's locked by another host
+                if [ "${_run}" = "Stopped" -a -e "${VM_DS_PATH}/${_name}/run.lock" ]; then
+                    _run=$(head -n1 "${VM_DS_PATH}/${_name}/run.lock")
+                    _run="Locked (${_run})"
+                fi
+
+                if [ -n "${VM_OPT_VERBOSE}" ]; then
+                    printf "${_format}" "${_name}" "${_ds}" "${_loader}" "${_cpu}" "${_memory}" "${_vnc}" "${_auto}" "${_pcpu}" "${_rss}" "${_uptime}" "${_run}"
+                else
+                    printf "${_format}" "${_name}" "${_ds}" "${_loader}" "${_cpu}" "${_memory}" "${_vnc}" "${_auto}" "${_run}"
+                fi
+            done
+        done
+    } | column -ts^
+}
+
+# 'vm create'
+# create a new virtual machine
+#
+# @param optional string (-t) _template the template to use (default = default)
+# @param optional string (-s) _size guest size (default = 20G)
+# @param string _name the name of the guest to create
+#
+core::create(){
+    local _name _opt _size _vmdir _disk _disk_dev _num=0
+    local _zfs_opts _disk_size _template="default" _ds="default" _ds_path _img _cpu _memory _uuid
+    local _enable_cloud_init _cloud_init_dir _ssh_public_key _ssh_key_file _network_config _mac
+
+    while getopts d:t:s:i:c:m:Ck:n: _opt ; do
+        case $_opt in
+            t) _template=${OPTARG} ;;
+            s) _size=${OPTARG} ;;
+            d) _ds=${OPTARG} ;;
+            c) _cpu=${OPTARG} ;;
+            m) _memory=${OPTARG} ;;
+            i) _img=${OPTARG} ;;
+            k) _ssh_key_file=${OPTARG} ;;
+            C) _enable_cloud_init='true' ;;
+            n) _network_config=${OPTARG} ;;
+
+            *) util::usage ;;
+        esac
+    done
+
+    shift $((OPTIND - 1))
+    _name=$1
+
+    [ -z "${_name}" ] && util::usage
+
+    # check guest name
+    util::check_name "${_name}" || util::err "invalid virtual machine name - '${_name}'"
+    datastore::get_guest "${_name}" && util::err "virtual machine already exists in ${VM_DS_PATH}/${_name}"
+    datastore::get "${_ds}" || util::err "unable to load datastore - '${_ds}'"
+
+    [ ! -f "${vm_dir}/.templates/${_template}.conf" ] && \
+        util::err "unable to find template ${vm_dir}/.templates/${_template}.conf"
+
+    # we need to get disk0 name and device type from the template
+    config::load "${vm_dir}/.templates/${_template}.conf"
+    config::get "_disk" "disk0_name"
+    config::get "_disk_dev" "disk0_dev"
+    config::get "_disk_size" "disk0_size" "20G"
+    config::get "_zfs_opts" "zfs_dataset_opts"
+
+    # make sure template has a disk before we start creating anything
+    [ -z "${_disk}" ] && util::err "template is missing disk0_name specification"
+
+    if [ -n "${_enable_cloud_init}" ]; then
+        if ! which genisoimage > /dev/null; then
+            util::err "Error: genisoimage is required to work with cloud init! Run 'pkg install cdrkit-genisoimage'."
+        fi
+    fi
+
+    # get ssh public key for cloud-init from file
+    if [ -n "${_ssh_key_file}" ]; then
+
+      [ -z "${_enable_cloud_init}" ] && util::err "cloud-init is required for injecting public key. Use -C to enable it."
+      [ ! -r "${_ssh_key_file}" ] && util::err "can't read file with public key (${_ssh_key_file})"
+      _ssh_public_key="$(cat "${_ssh_key_file}")"
+    fi
+
+    # if we're on zfs, make a new filesystem
+    zfs::make_dataset "${VM_DS_ZFS_DATASET}/${_name}" "${_zfs_opts}"
+
+    [ ! -d "${VM_DS_PATH}/${_name}" ] && mkdir "${VM_DS_PATH}/${_name}" >/dev/null 2>&1
+    [ ! -d "${VM_DS_PATH}/${_name}" ] && util::err "unable to create virtual machine directory ${VM_DS_PATH}/${_name}"
+
+    cp "${vm_dir}/.templates/${_template}.conf" "${VM_DS_PATH}/${_name}/${_name}.conf"
+    [ $? -eq 0 ] || util::err "unable to copy template to virtual machine directory"
+
+    # generate a uuid
+    _uuid=$(uuidgen)
+    config::set "${_name}" "uuid" ${_uuid}
+
+    # get any zvol options
+    config::get "_zfs_opts" "zfs_zvol_opts"
+
+    # generate mac address - it's saved in _mac variable
+    vm::generate_static_mac
+
+    # Optional overrides
+    [ -n "${_cpu}" ] && config::set "${_name}" "cpu" "${_cpu}"
+    [ -n "${_memory}" ] && config::set "${_name}" "memory" "${_memory}"
+    # use cmd line size for disk 0 if specified
+    [ -n "${_size}" ] && _disk_size="${_size}"
+
+    # create each disk
+    while [ -n "${_disk}" ]; do
+        case "${_disk_dev}" in 
+            zvol)
+                zfs::make_zvol "${VM_DS_ZFS_DATASET}/${_name}/${_disk}" "${_disk_size}" "0" "${_zfs_opts}"
+                [ $_num -eq 0 ] && [ ! -z "$_img" ] && core::write_img "/dev/zvol/${VM_DS_ZFS_DATASET}/${_name}/${_disk}" "${_img}"
+                ;;			
+            sparse-zvol)
+                zfs::make_zvol "${VM_DS_ZFS_DATASET}/${_name}/${_disk}" "${_disk_size}" "1" "${_zfs_opts}"
+                [ $_num -eq 0 ] && [ ! -z "$_img" ] && core::write_img "/dev/zvol/${VM_DS_ZFS_DATASET}/${_name}/${_disk}" "${_img}"
+                ;;
+            custom)
+                ;;
+            iscsi)
+                ;;
+            *)
+                truncate -s "${_disk_size}" "${VM_DS_PATH}/${_name}/${_disk}"
+                [ $? -eq 0 ] || util::err "failed to create sparse file for disk image"
+
+                # make sure only owner can read the disk image
+                chmod 600 "${VM_DS_PATH}/${_name}/${_disk}"
+                [ $_num -eq 0 ] && [ ! -z "$_img" ] && core::write_img "${VM_DS_PATH}/${_name}/${_disk}" "${_img}"
+                ;;
+        esac
+
+        # scrap size option from guest template
+        sysrc -inxqf "${VM_DS_PATH}/${_name}/${_name}.conf" "disk${_num}_size"
+
+        # look for another disk
+        _num=$((_num + 1))
+        config::get "_disk" "disk${_num}_name"
+        config::get "_disk_dev" "disk${_num}_dev"
+        config::get "_disk_size" "disk${_num}_size" "20G"
+    done
+
+    if [ -n "${_enable_cloud_init}" ]; then
+        core::create_cloud_init
+    fi
+
+    exit 0
+}
+
+core::create_cloud_init(){
+    # create disk with metadata for cloud-init
+    _cloud_init_dir="${VM_DS_PATH}/${_name}/.cloud-init"
+    # Use VM's name as a hostname by default
+    _hostname="${_name}"
+
+    mkdir -p "${_cloud_init_dir}"
+
+    if [ -n "${_network_config}" ]; then
+        # Example netconfig param: "ip=10.0.0.2/24;gateway=10.0.0.1;nameservers=1.1.1.1,8.8.8.8"
+        _network_config_ipaddress="$(echo "${_network_config}" | pcregrep -o "ip=\K[^;]*")"
+        _network_config_gateway="$(echo "${_network_config}" | pcregrep -o "gateway=\K[^;]*")"
+        _network_config_nameservers="$(echo "${_network_config}" | pcregrep -o "nameservers=\K[^;]*")"
+        _network_config_hostname="$(echo "${_network_config}" | pcregrep -o "hostname=\K[^;]*")"
+
+        # Override default hostname when network config is passed to cloud-init
+        if [ ! -z "${_network_config_hostname}" ]; then
+                _hostname="${_network_config_hostname}"
+        fi
+
+        cat << EOF > "${_cloud_init_dir}/network-config"
+version: 2
+ethernets:
+  id0:
+    set-name: eth0
+    match:
+      macaddress: "${_mac}"
+    addresses:
+      - ${_network_config_ipaddress}
+    gateway4: ${_network_config_gateway}
+    nameservers:
+      search: []
+      addresses: [${_network_config_nameservers}]
+EOF
+    fi
+
+    cat << EOF > "${_cloud_init_dir}/meta-data"
+instance-id: ${_uuid}
+local-hostname: ${_hostname}
+EOF
+
+    cat << EOF > "${_cloud_init_dir}/user-data"
+#cloud-config
+resize_rootfs: True
+manage_etc_hosts: localhost
+EOF
+
+    if [ -n "${_ssh_public_key}" ]; then
+        cat << EOF >> "${_cloud_init_dir}/user-data"
+ssh_authorized_keys:
+  - ${_ssh_public_key}
+EOF
+    fi
+
+    genisoimage -output "${VM_DS_PATH}/${_name}/seed.iso" -volid cidata -joliet -rock ${_cloud_init_dir}/* > /dev/null 2>&1 || util::err "Can't write seed.iso for cloud-init"
+    config::set "${_name}" "disk${_num}_type" "ahci-cd"
+    config::set "${_name}" "disk${_num}_name" "seed.iso"
+    config::set "${_name}" "disk${_num}_dev" "file"
+}
+
+# write cloud image to disk image
+#
+# @private
+# @param string _disk_dev device to write image to
+# @param string _img the img file in $vm_dir/.img to use
+#
+core::write_img(){
+    local _disk_dev _img _imgpath
+
+    cmd::parse_args "$@"
+    shift $?
+    _disk_dev="${1}"
+    _img="$2"
+    timeout=30
+    i=0
+
+    # wait a few seconds for newly created zvol device to appear
+    while [ $i -lt $timeout ]; do
+        if [ ! -r "${_disk_dev}" ]; then
+            sleep 1
+            i=$(($i+1))
+	else
+            break
+        fi
+    done
+
+    # just run start with an iso
+    datastore::img_find "_imgpath" "${_img}" || util::err "unable to locate img file - '${_img}'"
+    qemu-img dd -O raw if="${_imgpath}" of="${_disk_dev}" bs=1M
+    if [ $? -ne 0 ]; then
+        util::err "failed to write img file with qemu-img"
+    fi
+}
+
+# 'vm add'
+# add a device to an existing guest
+#
+# @param string (-d) _device=network|disk the type of device to add
+# @param string (-t) _type for disk, the type of disk - file|zvol|sparse-zvol
+# @param string (-s) _sopt for disk the size, for network the virtual switch name
+# @param string _name name of the guest
+#
+core::add(){
+    local _name _device _type _sopt _opt
+
+    while getopts d:t:s: _opt; do
+        case $_opt in
+            d) _device=${OPTARG} ;;
+            t) _type=${OPTARG} ;;
+            s) _sopt=${OPTARG} ;;
+            *) util::usage ;;
+        esac
+    done
+
+    shift $((OPTIND - 1))
+    _name="$1"
+
+    # check guest
+    [ -z "${_name}" ] && util::usage
+    datastore::get_guest "${_name}" || "${_name} does not appear to be a valid virtual machine"
+
+    case "${_device}" in
+        disk)    core::add_disk "${_name}" "${_type}" "${_sopt}" ;;
+        network) core::add_network "${_name}" "${_sopt}" ;;
+        *)       util::err "device must be one of the following: disk network" ;;
+    esac
+}
+
+# add a disk to guest
+# this creates the disk image or zvol and updates configuration file
+# we use the same emulation as the existing disk(s)
+#
+# @private
+# @param string _name name of the guest
+# @param string _device type of device file|zvol|sparse-zvol
+# @param string _size size of the disk to create
+#
+core::add_disk(){
+    local _name="$1"
+    local _device="$2"
+    local _size="$3"
+    local _num=0 _curr _diskname _emulation _zfs_opts
+
+    : ${_device:=file}
+
+    [ -z "${_size}" ] && util::usage
+
+    # get the last existing disk
+    config::load "${VM_DS_PATH}/${_name}/${_name}.conf"
+    config::get "_zfs_opts" "zfs_zvol_opts"
+
+    while true; do
+        config::get "_curr" "disk${_num}_name"
+        [ -z "${_curr}" ] && break
+        config::get "_emulation" "disk${_num}_type"
+        _num=$((_num + 1))
+    done
+
+    [ -z "${_emulation}" ] && util::err "failed to get emulation type of the existing guest disks"
+
+    # create the disk first, then update config if no problems
+    case "${_device}" in
+        zvol)
+            zfs::make_zvol "${VM_DS_ZFS_DATASET}/${_name}/disk${_num}" "${_size}" "0" "${_zfs_opts}"
+            _diskname="disk${_num}"
+            ;;
+        sparse-zvol)
+            zfs::make_zvol "${VM_DS_ZFS_DATASET}/${_name}/disk${_num}" "${_size}" "1" "${_zfs_opts}"
+            _diskname="disk${_num}"
+            ;;
+        file)
+            truncate -s "${_size}" "${VM_DS_PATH}/${_name}/disk${_num}.img"
+            [ $? -eq 0 ] || util::err "failed to create sparse file for disk image"
+            _diskname="disk${_num}.img"
+            ;;
+        *)
+            util::err "device type must be one of the following: zvol sparse-zvol file"
+            ;;
+    esac
+
+    # update configuration
+    config::set "${_name}" "disk${_num}_name" "${_diskname}"
+    config::set "${_name}" "disk${_num}_type" "${_emulation}" "1"
+    config::set "${_name}" "disk${_num}_dev" "${_device}" "1"
+    [ $? -eq 0 ] || util::err "disk image created but errors while updating guest configuration"
+}
+
+# add network interface to guest
+#
+# @private
+# @param string _name name of the guest
+# @param string _switch the switch name for this interface
+#
+core::add_network(){
+    local _name="$1"
+    local _switch="$2"
+    local _num=0 _curr _emulation
+
+    [ -z "${_switch}" ] && util::usage
+
+    config::load "${VM_DS_PATH}/${_name}/${_name}.conf"
+
+    while true; do
+        _emulation="${_curr}"
+        config::get "_curr" "network${_num}_type"
+        [ -z "${_curr}" ] && break
+        _num=$((_num + 1))
+    done
+
+    # handle no existing network
+    : ${_emulation:=virtio-net}
+
+    # update configuration
+    config::set "${_name}" "network${_num}_type" "${_emulation}"
+    config::set "${_name}" "network${_num}_switch" "${_switch}" "1"
+    [ $? -eq 0 ] || util::err "errors encountered while updating guest configuration"
+}
+
+# 'vm install'
+# install os to a virtual machine
+#
+# @param string _name the guest to install to
+# @param string _iso the iso file in $vm_dir/.iso to use
+#
+core::install(){
+    local _name _iso _fulliso
+
+    cmd::parse_args "$@"
+    shift $?
+    _name="$1"
+    _iso="$2"
+
+    [ -z "${_name}" -o -z "${_iso}" ] && util::usage
+
+    # just run start with an iso
+    datastore::iso_find "_fulliso" "${_iso}" || util::err "unable to locate iso file - '${_iso}'"
+    core::__start "${_name}" "${_fulliso}"
+}
+
+# 'vm startall'
+# start all virtual machines listed in rc.conf:$vm_list
+#
+core::startall(){
+    [ -z "${vm_list}" ] && exit
+    core::start ${vm_list}
+}
+
+# 'vm stopall'
+# stop all bhyve instances
+# note this will also stop instances not started by vm-bhyve
+#
+core::stopall(){
+    local _pids=$(pgrep -f 'bhyve:' | tr '\n' ' ')
+    local _stop_parallel _stop_list _running _list_rev _curr
+    local _stop_p_pids _pid
+
+    cmd::parse_args "$@"
+    : ${vm_delay:=2}
+
+    # get a list of running bhyve instances
+    _running=$(pgrep -lf 'bhyve:' | cut -d" " -f3 | tr '\n' ' ')
+    [ -z "${_running}" ] && return 0
+
+    # do we have any guests to stop in order
+    if [ -z "${VM_OPT_FORCE}" -a -n "${vm_list}" ]; then
+        # reverse the configured start order
+        for _curr in ${vm_list}; do
+            _list_rev="${_curr} ${_list_rev}"
+        done
+
+        # go through each autostart guest
+        # if running add to stop list.
+        # we are searching in reverse start order, so should get an ordered shutdown
+        for _curr in ${_list_rev}; do
+            echo "${_running}" | grep -qs "${_curr} "
+
+            if [ $? -eq 0 ]; then
+                _stop_list="${_stop_list}${_stop_list:+ }${_curr}"
+            fi
+        done
+
+        # look for anything running that isn't in the ordered stop list
+        for _curr in ${_running}; do
+            echo "${_stop_list}" | grep -qs "${_curr}\b"
+            if [ $? -ne 0 ]; then
+                _stop_parallel="${_stop_parallel}${_stop_parallel:+ }${_curr}"
+                util::getpid "_pid" "bhyve: ${_curr}\$"
+                [ $? -eq 0 ] && _stop_p_pids="${_stop_p_pids}${_stop_p_pids:+ }${_pid}"
+            fi
+        done
+    else
+        # nothing ordered, or a force shutdown
+        # just do everything at once
+        _stop_parallel="${_running}"
+        _stop_p_pids="${_pids}"
+    fi
+
+    echo "Beginning shutdown process"
+
+    # have any guests to stop in parallel
+    if [ -n "${_stop_p_pids}" ]; then
+        echo "  * parallel shutdown of non-ordered guests: ${_stop_parallel}"
+        kill ${_stop_p_pids} >/dev/null 2>&1
+        sleep 1
+        kill ${_stop_p_pids} >/dev/null 2>&1
+    fi
+
+    if [ -n "${_stop_list}" ]; then
+        _pid=""
+        for _curr in ${_stop_list}; do
+            [ -n "${_pid}" ] && echo "  * waiting ${vm_delay} second(s)" && sleep ${vm_delay}
+            util::getpid "_pid" "bhyve: ${_curr}\$"
+
+            if [ $? -eq 0 ]; then
+                echo "  * stopping ${_curr}"
+                kill ${_pid} >/dev/null 2>&1
+                sleep 1
+                kill ${_pid} >/dev/null 2>&1
+            fi
+        done
+    fi
+
+    echo ""
+    wait_for_pids ${_pids}
+}
+
+# 'vm start'
+# start a virtual machine
+#
+# @param string[multiple] _name the name of the guest(s) to start
+#
+core::start(){
+    local _name
+    local _done
+
+    cmd::parse_args "$@"
+    shift $?
+    _name="$1"
+
+    [ -z "${_name}" ] && util::usage
+    : ${vm_delay:=2}
+
+    # disable foreground/interactive if we're starting more than one
+    if [ $# -ge 2 ]; then
+        VM_OPT_FOREGROUND=""
+        VM_OPT_INTERACTIVE=""
+    fi
+
+    while [ -n "${_name}" ]; do
+        [ -n "${_done}" ] && echo "Waiting ${vm_delay} second(s)" && sleep ${vm_delay}
+        core::__start "${_name}"
+        shift
+        _name="$1"
+        _done="1"
+    done
+}
+
+# actually start a virtual machine
+#
+# @param string _name the name of the guest to start
+# @param optional string _iso iso file is this is an install (can only be provided through 'vm install' command)
+#
+core::__start(){
+    local _name="$1"
+    local _iso="$2"
+    local _cpu _memory _disk _guest _loader _console
+    local _tmux_cmd _tmux_name _util _uefi
+
+    [ -z "${_name}" ] && util::usage
+
+    echo "Starting ${_name}"
+
+    # try to find guest
+    if ! datastore::get_guest "${_name}"; then
+        echo "  ! ${_name} does not seem to be a valid virtual machine"
+        return 1
+    fi
+
+    echo "  * found guest in ${VM_DS_PATH}/${_name}"
+
+    # confirm we aren't running
+    if ! vm::confirm_stopped "${_name}" "1" >/dev/null 2>&1; then
+        echo "  ! guest appears to be running already"
+        return 1
+    fi
+
+    # check basic settings before going into background mode
+    config::load "${VM_DS_PATH}/${_name}/${_name}.conf"
+    config::get "_cpu" "cpu"
+    config::get "_memory" "memory"
+    config::get "_loader" "loader"
+
+    # check minimum configuration
+    if [ -z "${_cpu}" -o -z "${_memory}" ]; then
+        echo "  ! incomplete virtual machine configuration"
+        return 1
+    fi
+
+    # we can only load freebsd without unrestricted guest support
+    if [ -n "${VM_NO_UG}" -a "${_loader}" != "bhyveload" ]; then
+        echo "  ! no unrestricted guest support in cpu. only single vcpu FreeBSD guests supported"
+        return 1
+    fi
+
+    # check loader
+    if [ "${_loader}" = "grub" ]; then
+        _util=$(which grub-bhyve)
+
+        if [ -z "${_util}" ]; then
+            echo "  ! grub requested but sysutils/grub2-bhyve not installed?"
+            return 1
+        fi
+    fi
+
+    # check for tmux
+    config::core::get "_console" "console" "nmdm"
+    _tmux_cmd=$(which tmux)
+
+    if [ "${_console}" = "tmux" -a -z "${_tmux_cmd}" ]; then
+        echo "  ! tmux support enabled but misc/tmux not found"
+        return 1
+    fi
+
+    echo "  * booting..."
+
+    # run background process to actually start bhyve
+    # this will run as long as vm is running, including restarting bhyve after guest reboot
+    if [ -n "${VM_OPT_FOREGROUND}" ]; then
+        $0 _run -f "${_name}" "${_iso}"
+    elif [ "${_console}" = "tmux" ]; then
+        # can't have dots in tmux session :( (looks like it may use . to separate window.pane)
+        # use ~ which we don't normally allow
+        _tmux_name=$(echo "${_name}" | tr "." "~")
+
+        # start session and connect if in interactive mode
+        if [ -n "${VM_OPT_INTERACTIVE}" ]; then
+            ${_tmux_cmd} new -s "${_tmux_name}" $0 _run -tf "${_name}" "${_iso}"
+        else
+            ${_tmux_cmd} new -ds "${_tmux_name}" $0 _run -tf "${_name}" "${_iso}"
+        fi
+    else
+        $0 _run "${_name}" "${_iso}" >/dev/null 2>&1 &
+    fi
+}
+
+# 'vm restart'
+# restart a guest
+# all we do is create a "restart" file which vm-run looks for
+#
+# @param string _name name of the guest to restart
+#
+core::restart(){
+    local _name="$1"
+
+    datastore::get_guest "${_name}" || util::err "unable to locate specified guest"
+    echo "Setting guest restart flag"
+    touch "${VM_DS_PATH}/${_name}/restart" >/dev/null 2>&1
+    core::stop "${_name}"
+}
+
+# 'vm stop'
+# send a kill signal to the specified guest
+#
+# @param string[multiple] _name name of the guest to stop
+#
+core::stop(){
+    local _name="$1"
+    local _pid _loadpid
+
+    [ -z "${_name}" ] && util::usage
+
+    while [ -n "${_name}" ]; do
+        if [ ! -e "/dev/vmm/${_name}" ]; then
+            util::warn "${_name} doesn't appear to be a running virtual machine"
+        else
+            _pid=$(pgrep -fx "bhyve: ${_name}")
+            _loadpid=$(pgrep -fl "grub-bhyve|bhyveload" | grep " ${_name}\$" |cut -d' ' -f1)
+
+            if [ -n "${_pid}" ]; then
+                echo "Sending ACPI shutdown to ${_name}"
+                kill "${_pid}" >/dev/null 2>&1
+                sleep 1
+                kill "${_pid}" >/dev/null 2>&1
+            elif [ -n "${_loadpid}" ]; then
+                if util::confirm "Guest ${_name} is in bootloader stage, do you wish to force exit"; then
+                    echo "Killing ${_name}"
+                    kill "${_loadpid}"
+                    bhyvectl --destroy --vm=${_name} >/dev/null 2>&1
+                fi
+            else
+                util::warn "unable to locate process id for ${_name}"
+            fi
+        fi
+        shift
+        _name="$1"
+    done
+}
+
+# 'vm reset'
+# force reset
+#
+# @param string _name name of the guest
+#
+core::reset(){
+    local _name
+
+    cmd::parse_args "$@"
+    shift $?
+    _name="$1"
+
+    [ -z "${_name}" ] && util::usage
+    [ ! -e "/dev/vmm/${_name}" ] && util::err "${_name} doesn't appear to be a running virtual machine"
+
+    if [ -z "${VM_OPT_FORCE}" ]; then
+        util::confirm "Are you sure you want to forcefully reset this virtual machine" || exit 0
+    fi
+
+    bhyvectl --force-reset --vm=${_name}
+}
+
+# 'vm poweroff'
+# force poweroff
+#
+# @param string _name name of the guest
+#
+core::poweroff(){
+    local _name
+
+    cmd::parse_args "$@"
+    shift $?
+    _name="$1"
+
+    [ -z "${_name}" ] && util::usage
+    [ ! -e "/dev/vmm/${_name}" ] && util::err "${_name} doesn't appear to be a running virtual machine"
+
+    if [ -z "${VM_OPT_FORCE}" ]; then
+        util::confirm "Are you sure you want to forcefully poweroff this virtual machine" || exit 0
+    fi
+
+    bhyvectl --force-poweroff --vm=${_name}
+}
+
+# 'vm destroy'
+# completely remove a guest
+#
+# @param string _name name of the guest
+#
+core::destroy(){
+    local _name
+
+    cmd::parse_args "$@"
+    shift $?
+    _name="$1"
+
+    [ -z "${_name}" ] && util::usage
+
+    # trying to remove a snapshot?
+    echo "${_name}" | grep -qs "@"
+
+    if [ $? -eq 0 ]; then
+        zfs::remove_snapshot "${_name}"
+        exit $?
+    fi
+
+    # make sure it's stopped!
+    datastore::get_guest "${_name}" || util::err "${_name} doesn't appear to be a valid virtual machine"
+    vm::confirm_stopped "${_name}" || exit 1
+
+    if [ -z "${VM_OPT_FORCE}" ]; then
+        util::confirm "Are you sure you want to completely remove this virtual machine" || exit 0
+    fi
+
+    [ -n "${VM_DS_ZFS_DATASET}" ] && zfs::destroy_dataset "${VM_DS_ZFS_DATASET:?}/${_name:?}"
+    [ -e "${VM_DS_PATH}/${_name}" ] && rm -R "${VM_DS_PATH:?}/${_name:?}"
+
+    exit 0
+}
+
+# 'vm rename'
+# rename an existing guest
+#
+# @param string _old the existing guest name
+# @param string _new the new guest name
+#
+core::rename(){
+    local _old="$1"
+    local _new="$2"
+
+    [ -z "${_old}" -o -z "${_new}" ] && util::usage
+    util::check_name "${_new}" || util::err "invalid virtual machine name - '${_name}'"
+
+    datastore::get_guest "${_new}" && util::err "directory ${VM_DS_PATH}/${_new} already exists"
+    datastore::get_guest "${_old}" || util::err "${_old} doesn't appear to be a valid virtual machine"
+
+    # confirm guest stopped
+    vm::confirm_stopped "${_old}" || exit 1
+
+    # rename zfs dataset
+    zfs::rename_dataset "${_old}" "${_new}"
+
+    # rename folder if it still exists (shouldn't if zfs mode and rename worked)
+    if [ -d "${VM_DS_PATH}/${_old}" ]; then
+        mv "${VM_DS_PATH}/${_old}" "${VM_DS_PATH}/${_new}" >/dev/null 2>&1
+        [ $? -eq 0 ] || util::err "failed to rename guest directory"
+    fi
+
+    # rename config file
+    mv "${VM_DS_PATH}/${_new}/${_old}.conf" "${VM_DS_PATH}/${_new}/${_new}.conf" >/dev/null 2>&1
+    [ $? -eq 0 ] || util::err "changed guest directory but failed to rename configuration file"
+}
+
+# 'vm console'
+# connect to the console (nmdm) of the specified guest
+# we store the nmdm for com1 & com2 in $vm_dir/{guest}/console
+# if no port is specified, we use the first one that is specified in the configuration file
+# so if comports="com2 com1", it will connect to com2
+# the boot loader always using the nmdm device of the first com port listed
+#
+# @param string _name name of the guest
+# @param string _port the port to connect to (default = first in configuration)
+#
+core::console(){
+    local _name="$1"
+    local _port="$2"
+    local _console _tmux _tmux_cmd
+
+    [ -z "${_name}" ] && util::usage
+
+    datastore::get_guest "${_name}" || util::err "${_name} doesn't appear to be a valid virtual machine"
+    [ ! -e "/dev/vmm/${_name}" ] && util::err "${_name} doesn't appear to be a running virtual machine"
+
+    if [ -e "${VM_DS_PATH}/${_name}/console" ]; then
+
+        # did user specify a com port?
+        # if not, get first in the file (the first will also be the console used for loader)
+        if [ -n "${_port}" ]; then
+            _console=$(grep "${_port}=" "${VM_DS_PATH}/${_name}/console" | cut -d= -f2)
+        else
+            _console=$(head -n 1 "${VM_DS_PATH}/${_name}/console" | grep "^com" | cut -d= -f2)
+        fi
+    fi
+
+    # is this a tmux console?
+    if [ "${_console%%/*}" = "tmux" ]; then
+        _tmux_cmd=$(which tmux)
+
+        if [ -n "${_tmux_cmd}" ]; then
+            _tmux=$("${_tmux_cmd}" ls |grep "^${_name}:")
+
+            if [ -n "${_tmux}" ]; then
+                ${_tmux_cmd} attach -t ${_console##*/}
+                exit
+            fi
+        fi
+    fi
+
+    [ -z "${_console}" ] && util::err "unable to locate console device for this virtual machine"
+    cu -l "${_console}"
+}
+
+# 'vm configure'
+# configure a machine (edit the configuration file)
+#
+# @param string _name name of the guest
+#
+core::configure(){
+    local _name="$1"
+
+    [ -z "${_name}" ] && util::usage
+    [ -z "${EDITOR}" ] && EDITOR="vi"
+
+    datastore::get_guest "${_name}" || \
+        util::err "cannot locate configuration file for virtual machine: ${_name}"
+
+    $EDITOR "${VM_DS_PATH}/${_name}/${_name}.conf"
+}
+
+# 'vm iso'
+# list iso images or get a new one
+#
+# @param string _url if specified, the url will be fetch'ed into $vm_dir/.iso
+#
+core::iso(){
+    local _url _ds="default"
+
+    while getopts d:u _opt ; do
+        case $_opt in
+            d) _ds=${OPTARG} ;;
+            *) util::usage ;;
+        esac
+    done
+
+    shift $((OPTIND - 1))
+    _url=$1
+
+    if [ -n "${_url}" ]; then
+        datastore::get_iso "${_ds}" || util::err "unable to locate path for datastore '${_ds}'"
+        fetch -o "${VM_DS_PATH}" "${_url}"
+    else
+        datastore::iso_list
+    fi
+}
+
+# uncompress cloud image
+#
+# @private
+# @param string _filepath path to file to decompress
+#
+core::decompress(){
+    local _filepath
+
+    cmd::parse_args "$@"
+    shift $?
+    _filepath="${1}"
+
+    if echo "${_filepath}" | grep "\.xz$" > /dev/null; then
+        xz -d "${_filepath}"
+    elif echo "${_filepath}" | grep "\.tar\.gz$" > /dev/null; then
+        tar Szxf "${_filepath}" -C "$(dirname "${_filepath}")"
+        rm -f "${_filepath}"
+    elif echo "${_filepath}" | grep "\.gz$" > /dev/null; then
+        gunzip "${_filepath}"
+    fi
+}
+
+# 'vm img'
+# list cloud images or get a new one
+#
+# @param string _url if specified, the url will be fetch'ed into $vm_dir/.img
+#
+core::img(){
+    local _url _ds="default" _filename
+    if ! which qemu-img > /dev/null; then
+        util::err "Error: qemu-img is required to work with cloud images! Run 'pkg install qemu-tools'."
+    fi
+
+    while getopts d:u _opt ; do
+        case $_opt in
+            d) _ds=${OPTARG} ;;
+            *) util::usage ;;
+        esac
+    done
+
+    shift $((OPTIND - 1))
+    _url=$1
+
+    if [ -n "${_url}" ]; then
+        datastore::get_img "${_ds}" || util::err "unable to locate path for datastore '${_ds}'"
+        _filename=$(basename "${_url}")
+        fetch -o "${VM_DS_PATH}" "${_url}"
+        core::decompress "${VM_DS_PATH}/${_filename}"
+    else
+        datastore::img_list
+    fi
+}
+
+# 'vm passthru'
+# show a list of available passthrough devices
+# and their device number
+#
+core::passthru(){
+    local _dev _sbf _desc _ready
+    local _format="%-10s %-12s %-12s %s\n"
+
+    printf "${_format}" "DEVICE" "BHYVE ID" "READY" "DESCRIPTION"
+
+    pciconf -l | awk -F'[@:]' '{ print $1,$3 "/" $4 "/" $5}' | \
+    while read _dev _sbf; do
+
+        _ready=$(echo "${_dev}" | grep ^ppt)
+        [ -n "${_ready}" ] && _ready="Yes"
+
+        _desc=$(pciconf -lv | grep -A2 "^${_dev}@" | tail -n1 | grep device | cut -d\' -f2)
+        printf "${_format}" "${_dev}" "${_sbf}" "${_ready:-No}" "${_desc:--}"
+    done
+}
+
+# 'vm get'
+# get a core configuration setting
+#
+core::get(){
+    local _var="$1"
+    local _val _format="%-20s%s\n"
+    local IFS=";"
+
+    printf "${_format}" "SETTING" "VALUE"
+
+    if [ "${_var}" = "all" ]; then
+
+        for _var in ${VM_CONFIG_USER}; do
+            config::core::get "_val" "${_var}"
+            printf "${_format}" "${_var}" "${_val:--}"
+        done
+    else
+        while [ -n "${_var}" ]; do
+            if util::valid_config_setting "${_var}"; then
+                config::core::get "_val" "${_var}"
+                printf "${_format}" "${_var}" "${_val:--}"
+            fi
+
+            shift
+            _var="$1"
+        done
+    fi
+}
+
+# 'vm set'
+# set a core configuration setting
+#
+core::set(){
+    local _pair="$1"
+    local _key _val
+
+    while [ -n "${_pair}" ]; do
+        _key="${_pair%%=*}"
+        _val="${_pair#*=}"
+
+        if util::valid_config_setting "${_key}"; then
+            config::core::set "${_key}" "${_val}"
+        else
+            util::err "invalid configuration setting - '${_key}'"
+        fi
+
+        shift
+        _pair="$1"
+    done
+}

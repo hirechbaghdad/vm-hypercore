@@ -1,0 +1,278 @@
+#!/bin/sh
+#-------------------------------------------------------------------------+
+# Copyright (C) 2021 Matt Churchyard (churchers@gmail.com)
+# All rights reserved
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted providing that the following conditions
+# are met:
+# 1. Redistributions of source code must retain the above copyright
+#    notice, this list of conditions and the following disclaimer.
+# 2. Redistributions in binary form must reproduce the above copyright
+#    notice, this list of conditions and the following disclaimer in the
+#    documentation and/or other materials provided with the distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESS OR
+# IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+# WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+# ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY
+# DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+# OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+# HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
+# STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING
+# IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+# POSSIBILITY OF SUCH DAMAGE.
+
+# vm migrate ...
+#
+# @param string name the guest to send
+# @param string host host to send guest to
+#
+migration::run(){
+    local _name
+    local _ds="default"
+    local _start="1"
+    local _renaming="0"
+    local _config _opt _stage _inc _triple _rdataset _pid _exists _rname _running
+    local _snap1 _snap2 _snap3 _destroy
+    local _count=0
+
+    while getopts cn12txr:d:i: _opt; do
+        case $_opt in
+            c) _config="1" ;;
+            r) _rname="${OPTARG}" ;;
+            n) _start="" ;;
+            i) _inc="${OPTARG}" ;;
+            1) _stage="1" ;;
+            2) _stage="2" ;;
+            t) _triple="1" ;;
+            x) _destroy="1" ;;
+            d) _ds="${OPTARG}" ;;
+        esac
+    done
+
+    # get the name and host
+    shift $((OPTIND -1))
+    _name="$1"
+    _host="$2"
+
+    # do we want to output our config?
+    # sender uses the config option to pull config from the recieve end
+    if [ -n "${_config}" ]; then
+        migration::__check_config "${_ds}"
+        exit
+    fi
+
+    # basic checks
+    [ -z "${_name}" -o -z "${_host}" ] && util::usage
+    datastore::get_guest "${_name}" || util:err "unable to locate guest - '${_name}'"
+    [ -z "${VM_DS_ZFS}" ] && util:err "the source datastore must be ZFS to support migration"
+    [ -n "${_stage}" -a -n "${_triple}" ] && util::err "single stage and triple stage are mutually exclusive"
+    [ "${_stage}" = "2" -a -z "${_inc}" ] && util::err "source snapshot must be given when running stage 2"
+
+    if [ -n "${_rname}" ]; then
+        util::check_name "${_rname}" || util::err "invalid virtual machine name - '${_rname}'"
+        _renaming="1"
+    else
+        _rname="${_name}"
+    fi
+
+    # check guest can be sent
+    config::load "${VM_DS_PATH}/${_name}/${_name}.conf"
+    migration::__check_compat
+
+    # check running state
+    vm::confirm_stopped "${_name}" "1" >/dev/null 2>&1
+    _state=$?
+    [ ${_state} -eq 2 ] && util::err "guest is powered up on another host"
+    [ ${_state} -eq 1 ] && _running="1"
+
+    # try to get pid
+    if [ -n "${_running}" ]; then
+        _pid=$(pgrep -fx "bhyve: ${_name}")
+        [ -z "${_pid}" ] && util::err "guest seems to be running but can't find its pid"
+    fi
+
+    # try to get remote config
+    _rdataset=$(ssh "${_host}" vm migrate -cd "${_ds}" 2>/dev/null)
+    [ $? = "1" -o -z "${_rdataset}" ] && util::err "unable to get config from ${_host}"
+
+    echo "Attempting to send ${_name} to ${_host}"
+    echo "  * remote dataset ${_rdataset}/${_rname}"
+    [ -n "${_running}" ] && echo "  * source guest is powered on (#${_pid})"
+
+    # STAGE 1
+    # we send a full snapshot of the guest
+    if [ -z "${_stage}" -o "${_stage}" = "1" ]; then
+        _snap1="$(date +'%Y%m%d%H%M%S-s1')"
+        echo "  * stage 1: taking snapshot ${_snap1}"
+        zfs snapshot -r "${VM_DS_ZFS_DATASET}/${_name}@${_snap1}" >/dev/null 2>&1
+        [ $? -eq 0 ] || util::err_inline "error taking local snapshot"
+
+        # send this snapshot
+        migrate::__send "1" "${_snap1}" "${_inc}"
+    fi
+
+    # STAGE 1B
+    # do it again in triple mode
+    # for a big guest, hopefully not too much changed during full send
+    # this will therefore complete fairly quick, leaving very few changes for stage 2
+    if [ -n "${_triple}" ]; then
+        _snap2="$(date +'%Y%m%d%H%M%S-s1b')"
+        echo "  * stage 1b: taking snapshot ${_snap2}"
+        zfs snapshot -r "${VM_DS_ZFS_DATASET}/${_name}@${_snap2}" >/dev/null 2>&1
+        [ $? -eq 0 ] || util::err_inline "error taking local snapshot"
+
+        # send this snapshot
+        migrate::__send "1b" "${_snap2}" "${_snap1}"
+    fi
+
+    # only running first stage
+    if [ "${_stage}" = "1" ]; then
+        echo "  * done"
+        exit
+    fi
+
+    # if it's running we now need to stop it
+    if [ -n "${_running}" ]; then
+        echo -n "  * stage 2: attempting to stop guest"
+
+        kill ${_pid} >/dev/null 2>&1
+
+        while [ ${_count} -lt 60 ]; do
+            sleep 2
+            kill -0 ${_pid} >/dev/null 2>&1 || break
+            echo -n "."
+            _count=$((_count + 1))
+        done
+
+        echo ""
+    fi
+
+    # has it stopped?
+    kill -0 ${_pid} >/dev/null 2>&1 && util:err_inline "failed to stop guest"
+    echo "  * stage 2: guest powered off"
+
+    # only needed if running or specifically doing a stage 2
+    if [ -n "${_running}" -o "${_stage}" = "2" ]; then
+        _snap3="$(date +'%Y%m%d%H%M%S-s2')"
+        echo "  * stage 2: taking snapshot ${_snap3}"
+        zfs snapshot -r "${VM_DS_ZFS_DATASET}/${_name}@${_snap3}" >/dev/null 2>&1
+        [ $? -eq 0 ] || util::err_inline "error taking local snapshot"
+
+        # send this snapshot
+        if [ "${_triple}" = "1" ]; then
+            migrate::__send "2" "${_snap3}" "${_snap2}"
+        elif [ "${_stage}" = "2" ]; then
+            migrate::__send "2" "${_snap3}" "${_inc}"
+        else
+            migrate::__send "2" "${_snap3}" "${_snap1}"
+        fi
+    fi
+
+    # do we need to rename?
+    [ "${_renaming}" = "1" ] && migrate::__rename_config
+
+    # start
+    if [ -n "${_start}" -a -n "${_running}" ]; then
+        echo "  * attempting to start ${_rname} on ${_host}"
+        ssh ${_host} vm start ${_rname}
+    fi
+
+    if [ -n "${_destroy}" ]; then
+        echo "  * removing source guest"
+        zfs destroy -r "${VM_DS_ZFS_DATASET}/${_name}"
+    else
+        echo "  * removing snapshots"
+        [ -n "${_snap1}" ] && zfs destroy "${VM_DS_ZFS_DATASET}/${_name}@${_snap1}" >/dev/null 2>&1
+        [ -n "${_snap2}" ] && zfs destroy "${VM_DS_ZFS_DATASET}/${_name}@${_snap2}" >/dev/null 2>&1
+        [ -n "${_snap3}" ] && zfs destroy "${VM_DS_ZFS_DATASET}/${_name}@${_snap3}" >/dev/null 2>&1
+    fi
+
+    echo "  * done"
+}
+
+# updates the config file for a renamed guest
+# god knows why I didn't just use "guest.conf"
+#
+migrate::__rename_config(){
+    local _path
+
+    # we need the mount path first
+    _path=$(ssh "${_host}" mount | grep "^${_rdataset} " | cut -wf3)
+
+    if [ $? -ne 0 -o -z "${_path}" ]; then
+        echo "  ! failed to find remote datastore path. guest may not start"
+        return 1
+    fi
+
+    # make sure it's mounted on remote
+    ssh "${_host}" zfs mount "${_rdataset}/${_rname}" >/dev/null 2>&1
+
+    echo "  * renaming configuration file to ${_rname}.conf"
+    ssh "${_host}" mv "${_path}/${_rname}/${_name}.conf" "${_path}/${_rname}/${_rname}.conf" >/dev/null 2>1
+
+    if [ $? -ne 0 ]; then
+        echo "  ! failed to find rename remote configuration file. guest may not start"
+        return 1
+    fi
+}
+
+migrate::__send(){
+    local _stage="$1"
+    local _snap="$2"
+    local _inc="$3"
+
+    # are we sending incremental?
+    if [ -n "${_inc}" ]; then
+        echo "  * stage ${_stage}: sending ${VM_DS_ZFS_DATASET}/${_name}@${_snap} (incremental source ${_inc})"
+        zfs send -Ri "${_inc}" "${VM_DS_ZFS_DATASET}/${_name}@${_snap}" | ssh ${_host} zfs recv "${_rdataset}/${_rname}"
+    else
+        echo "  * stage ${_stage}: sending ${VM_DS_ZFS_DATASET}/${_name}@${_snap}"
+        zfs send -R "${VM_DS_ZFS_DATASET}/${_name}@${_snap}" | ssh ${_host} zfs recv "${_rdataset}/${_rname}"
+    fi
+
+    [ $? -eq 0 ] || util::err_inline "error detected while sending snapshot"
+    echo "  * stage ${_stage}: snapshot sent"
+}
+
+# currently just outputs zfs path or error if datastore isn't zfs
+# in future may also return some data we can use to verify compat, etc
+#
+# @param string _ds the datastore to get details of
+#
+migration::__check_config(){
+    local _ds="$1"
+
+    datastore::get "${_ds}"
+    [ -z "${VM_DS_ZFS}" ] && exit 1
+
+    # output the datastore dataset
+    # sender needs this to do a zfs recv
+    echo "${VM_DS_ZFS_DATASET}"
+}
+
+# see if a guest can be migrated.
+# there are a few guest settings that are likely to
+# cause the guest to break if it's moved to another host
+#
+migration::__check_compat(){
+    local _setting _err _num=0
+
+    # check pass through
+    config::get "_setting" "passthru0"
+    [ -n "${_setting}" ] && _err="pci pass-through enabled"
+
+    # check for custom disks
+    # file/zvol are under guest dataset and should go across ok
+    # custom disks could be anywhere
+    while true; do
+        config::get "_setting" "disk${_num}_type"
+        [ -z "${_setting}" ] && break
+        [ "${_setting}" = "custom" ] && _err="custom disk(s) configured" && break
+        _num=$((_num + 1))
+    done
+
+    [ -n "${_err}" ] && util::err "migration is not supported for this guest (${_err})"
+}

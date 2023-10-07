@@ -1,0 +1,405 @@
+#!/bin/sh
+#-------------------------------------------------------------------------+
+# Copyright (C) 2016 Matt Churchyard (churchers@gmail.com)
+# All rights reserved
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted providing that the following conditions
+# are met:
+# 1. Redistributions of source code must retain the above copyright
+#    notice, this list of conditions and the following disclaimer.
+# 2. Redistributions in binary form must reproduce the above copyright
+#    notice, this list of conditions and the following disclaimer in the
+#    documentation and/or other materials provided with the distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESS OR
+# IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+# WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+# ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY
+# DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+# OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+# HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
+# STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING
+# IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+# POSSIBILITY OF SUCH DAMAGE.
+
+# make sure we have the right environment
+#
+util::setup(){
+    util::load_module "nmdm"
+    util::load_module "if_bridge"
+
+    # tap(4) & tun(4) were unified in r347241, this is closest ABI bump
+    if [ `uname -K` -ge 1300029 ]; then
+        util::load_module "if_tuntap"
+    else
+        util::load_module "if_tap"
+    fi
+
+    sysctl net.link.tap.up_on_open=1 >/dev/null 2>&1
+
+    # do we have the default template example, but no default in our .templates?
+    # if so, get a copy, this at least allows a simple "vm create" to work out of the box
+    if [ -e "/usr/local/share/examples/vm-bhyve/default.conf" -a ! -e "${vm_dir}/.templates/default.conf" ]; then
+        cp "/usr/local/share/examples/vm-bhyve/default.conf" "${vm_dir}/.templates/" >/dev/null 2>&1
+    fi
+}
+
+# load a kernel module
+#
+# @param string _mod the module name
+#
+util::load_module(){
+    local _mod="$1"
+    kldstat -qm ${_mod} >/dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        kldload ${_mod} >/dev/null 2>&1
+        [ $? -eq 0 ] || util::err "unable to load ${_mod}.ko!"
+    fi
+}
+
+# check if system have bhyve support
+# look for sysctls set by the vmm module. I can't get confirmation that this
+# is a valid way to check vmm is working, even though it seems reasonable.
+# the vm_disable_host_checks="yes" rc settings allows bypassing all this
+# if your system should be supported but these checks break.
+# 
+# @modifies VM_NO_UG
+#
+util::check_bhyve_support(){
+
+    # almost all our functionality requires access to things only root can do
+    [ `id -u` -ne 0 ] && util::err "virtual machines can only be managed by root"
+
+    # try to load the vmm module
+    # we do this here to make sure the sysctls exist, and before disable_host_checks
+    # as we want this loaded anyway. FreeBSD version check removed as the
+    # module won't exist on systems too old for bhyve
+    util::load_module "vmm"
+
+    # don't check if user wants to bypass host checks
+    util::yesno "$vm_disable_host_checks" && return 0
+
+    # check sysctls
+    # these only work for intel
+    # for AMD we give up trying to check for the time being
+    sysctl hw.model |grep Intel >/dev/null 2>&1
+
+    if [ $? -eq 0 ]; then
+        [ "`sysctl -n hw.vmm.vmx.initialized 2>/dev/null`" != "1" ] && util::err "kernel vmm not initialised (no VT-x / AMD SVM cpu support?)"
+        [ "`sysctl -n hw.vmm.vmx.cap.unrestricted_guest 2>/dev/null`" != "1" ] && VM_NO_UG="1"
+    fi
+}
+
+# check for passthru support
+# following neel@ wiki we search for DMAR acpi table for vt-d
+# and we check sysctl if amdvi is present and enabled
+#
+# @return success if host has vt-d or amdvi
+#
+util::check_bhyve_iommu(){
+    local _vtd
+    local _amdvi
+
+    # don't check if user wants to bypass host checks
+    # think this check is fairly solid but there's probably someone somewhere
+    # with iommu support that our tests fail for.
+    util::yesno "$vm_disable_host_checks" && return 0
+
+    _vtd=$(acpidump -t |grep DMAR)
+    _amdvi=$(sysctl hw |grep 'vmm.amdvi.enable: 1')
+    [ -z "${_vtd}" -a -z "${_amdvi}" ] && return 1
+
+    return 0
+}
+
+# restart a local service
+# checks if service is running and either starts or restarts
+#
+# @param string _serv the name of the service
+#
+util::restart_service(){
+    local _serv="$1"
+    local _cmd="restart"
+
+    # see if it's actually running
+    service ${_serv} status >/dev/null 2>&1
+    [ $? -ne 0 ] && _cmd="start"
+
+    service ${_serv} ${_cmd} >/dev/null 2>&1
+    [ $? -ne 0 ] && util::warn "failed to ${_cmd} service ${_serv}"
+}
+
+# show version
+#
+util::version(){
+    echo "vm-bhyve: Bhyve virtual machine management v${VERSION} (rev. ${VERSION_INT})"
+}
+
+# show version & usage information
+# we exit after running this
+#
+util::usage(){
+    util::version
+    cat << EOT
+Usage: vm ...
+    version
+    init
+    set [setting=value] [...]
+    get [all|setting] [...]
+    switch list
+    switch info [name] [...]
+    switch create [-t type] [-i interface] [-n vlan-id] [-m mtu] [-a address/prefix-len] [-b bridge] [-p] <name>
+    switch vlan <name> <vlan|0>
+    switch nat <name> <on|off>
+    switch private <name> <on|off>
+    switch add <name> <interface>
+    switch remove <name> <interface>
+    switch destroy <name>
+    datastore list
+    datastore add <name> <spec>
+    datastore remove <name>
+    datastore add <name> <path>
+    list
+    info [name] [...]
+    create [-d datastore] [-t template] [-s size] [-m memory] [-c vCPUs] <name>
+    install [-fi] <name> <iso>
+    start [-fi] <name> [...]
+    stop <name> [...]
+    restart <name>
+    console <name> [com1|com2]
+    configure <name>
+    rename <name> <new-name>
+    add [-d device] [-t type] [-s size|switch] <name>
+    startall
+    stopall
+    reset  [-f] <name>
+    poweroff [-f] <name>
+    destroy [-f] <name>
+    passthru
+    clone <name[@snapshot]> <new-name>
+    snapshot [-f] <name[@snapshot]>
+    rollback [-r] <name@snapshot>
+    iso [url]
+    img [url]
+    image list
+    image create [-d description] [-u] <name>
+    image destroy <uuid>
+    image provision [-d datastore] <uuid> <newname>
+EOT
+    exit 1
+}
+
+# err
+# display an error message and exit immediately
+#
+# @param string - the message to display
+#
+util::err(){
+    echo "${0}: ERROR: $1" >&2
+    exit 1
+}
+
+# err_inline
+# display an error inline with informational output
+#
+# @param string - message to display
+#
+util::err_inline(){
+    echo "  ! $1"
+    exit 1
+}
+
+# warn
+# display warning, but do not exit
+#
+# @param string - the message to display
+#
+util::warn(){
+    echo "${0}: WARNING: $1" >&2
+}
+
+# log_rotate
+# simple rotation of log files
+# if we hit 1MB, which should cover a fair amount of history,
+# we move existing log and and create a new one.
+# one keep 1 previous file, as that should be enough
+#
+# @param string _type whether to rotate guest or main log
+#
+util::log_rotate(){
+    local _type="$1"
+    local _lf="vm-bhyve.log"
+    local _file _size _guest
+
+    case "${_type}" in
+        guest)
+            _guest="$2"
+            _file="${VM_DS_PATH}/${_guest}/${_lf}"
+            ;;
+        system)
+            _file="${vm_dir}/${_lf}"
+            ;;
+    esac
+
+    if [ -e "${_file}" ]; then
+        _size=$(stat -f %z "${_file}")
+
+        if [ -n "${_size}" -a "${_size}" -ge 1048576 ]; then
+            unlink "${_file}.0.gz" >/dev/null 2>&1
+            mv "${_file}" "${_file}.0"
+            gzip "${_file}.0"
+        fi
+    fi
+}
+
+# log to file
+# writes the date and a message to the specified log
+# the global log is in $vm_dir/vm-bhyve.log
+# guest logs are $vm_dir/{guest}/vm-bhyve.log
+#
+# @param string _type=guest|system log to global vm-bhyve log or guest
+# @param optional string _guest if _type=guest, the guest name, otherwise do not provide at all
+# @param string _message the message to log
+#
+util::log(){
+    local _type="$1"
+    local _lf="vm-bhyve.log"
+    local _guest _message _file _date
+
+    case "${_type}" in
+        guest)
+            _guest="$2"
+            _file="${VM_DS_PATH}/${_guest}/${_lf}"
+            shift 2
+            ;;
+        system)
+            _file="${vm_dir}/${_lf}"
+            shift 1
+            ;;
+    esac
+
+    while [ -n "$1" ]; do
+      echo "$(date +'%b %d %T'): $1" >> "${_file}"
+      shift
+    done
+}
+
+# write content to a file, and log what we
+# did to the guest log file
+# it's useful to be able to see what files vm-bhyve is creating
+# and the contents so we write that to the log.
+# The file is created in $vm_dir/{guest}
+#
+# @param string _type=write|appnd create file or append to it
+# @param string _guest the guest name
+# @param string _file the file name to write to
+# @param string _message the data to write
+#
+util::log_and_write(){
+    local _type="$1"
+    local _guest="$2"
+    local _file="${VM_DS_PATH}/${_guest}/$3"
+    local _message="$4"
+
+    if [ "${_type}" = "write" ]; then
+        util::log "guest" "${_guest}" "create file ${_file}"
+        echo "${_message}" > "${_file}"
+    else
+        echo "${_message}" >> "${_file}"
+    fi
+
+    util::log "guest" "${_guest}" " -> ${_message}"
+}
+
+# confirm yes or no
+#
+# @param string _msh message to display
+# @return int success if confirmed
+#
+util::confirm(){
+    local _msg="$1"
+    local _resp
+
+    while read -p "${_msg} (y/n)? " _resp; do
+        case "${_resp}" in
+            y*) return 0 ;;
+            n*) return 1 ;;
+        esac
+    done
+}
+
+# our own checkyesno copy
+# doesn't warn for unsupported values
+# also returns as 'yes' unless value is specifically no/off/false/0 
+#
+# @param _value the value to test
+# @return int 1 if set to "off/false/no/0", 0 otherwise
+#
+util::yesno(){
+    local _value="$1"
+
+    [ -z "${_value}" ] && return 1
+
+    case "$_value" in
+        [Nn][Oo]|[Ff][Aa][Ll][Ss][Ee]|[Oo][Ff][Ff]|0)
+            return 1 ;;
+        *)  return 0 ;;		
+    esac
+}
+
+# 'vm check name'
+# check name of virtual machine
+#
+# @param _name name to check
+# @param _maxlen=30(229 on 13+) maximum name length (NOTE should be 2 less than desired)
+# @return int 0 if name is valid
+#
+util::check_name(){
+    local _name="$1"
+    local _maxlen="$2"
+
+    if [ -z "${_maxlen}" ]; then
+        if [ ${VERSION_BSD} -ge 1300000 ]; then
+            : ${_maxlen:=229}
+        else
+            : ${_maxlen:=30}
+        fi
+    fi
+
+    echo "${_name}" | egrep -iqs "^[a-z0-9][.a-z0-9_-]{0,${_maxlen}}[a-z0-9]\$"
+}
+
+# check if the specified string is a valid core configuration
+# setting that the user can change
+#
+# @param string the setting name to look for
+#
+util::valid_config_setting(){
+    echo "${VM_CONFIG_USER}" | grep -iqs "${1};"
+}
+
+# __getpid
+# get a process id
+#
+# @param string _var variable to put pid into
+# @param string _proc process to look for
+#
+util::getpid(){
+    local _var="$1"
+    local _proc="$2"
+    local _ret
+
+    _ret=$(pgrep -f "${_proc}")
+    [ $? -eq 0 ] || return 1
+    setvar "${_var}" "${_ret}"
+}
+
+util::get_part(){
+    local _var="$1"
+    local _data="$2"
+    local _num="$3"
+
+    setvar "${_var}" $(echo "${_data}" |cut -w -f${_num})
+}
